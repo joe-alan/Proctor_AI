@@ -1,0 +1,11 @@
+EXAM MONITORING - BEHAVIOR ANALYSIS REPORT
+==================================================
+
+Total Alerts Generated: 0
+Average Severity: 0.00
+Maximum Severity: 0.00
+
+Alert Breakdown by Type:
+
+Detailed Alert History:
+------------------------------
