@@ -15,7 +15,8 @@ class BehaviorAnalyzer:
                  movement_threshold: float = 15.0,
                  clustering_threshold: float = 120.0,
                  attention_threshold: float = 0.4,
-                 alert_cooldown: int = 30):
+                 alert_cooldown: int = 30,
+                 alert_persistence: int = 90):
         """
         Initialize behavior analyzer with detection thresholds.
         
@@ -24,16 +25,19 @@ class BehaviorAnalyzer:
             clustering_threshold: Distance threshold for clustering detection
             attention_threshold: Aspect ratio change threshold for attention detection
             alert_cooldown: Minimum frames between same alert types
+            alert_persistence: Frames to keep alerts visible on screen
         """
         self.movement_threshold = movement_threshold
         self.clustering_threshold = clustering_threshold  
         self.attention_threshold = attention_threshold
         self.alert_cooldown = alert_cooldown
+        self.alert_persistence = alert_persistence
         
         # Alert tracking
         self.alerts_history = deque(maxlen=1000)
         self.recent_alerts = defaultdict(int)  # Track recent alerts per person
         self.alert_counters = defaultdict(int)
+        self.persistent_alerts = deque(maxlen=10)  # Keep recent alerts visible
         
         # Behavior tracking
         self.person_behaviors = {}
@@ -47,6 +51,7 @@ class BehaviorAnalyzer:
         print(f"   Movement threshold: {movement_threshold} pixels")
         print(f"   Clustering threshold: {clustering_threshold} pixels")
         print(f"   Attention threshold: {attention_threshold}")
+        print(f"   Alert persistence: {alert_persistence} frames")
     
     def analyze_behavior(self, tracks: Dict[int, Dict], frame_num: int) -> List[Dict]:
         """
@@ -78,11 +83,20 @@ class BehaviorAnalyzer:
         group_alerts = self._analyze_group_behavior(tracks)
         current_alerts.extend(group_alerts)
         
-        # Store alerts in history
+        # Store alerts in history and persistent display
         for alert in current_alerts:
             alert['frame'] = frame_num
             alert['timestamp'] = time.time()
+            alert['expires_at'] = frame_num + self.alert_persistence
             self.alerts_history.append(alert)
+            self.persistent_alerts.append(alert)
+        
+        # Clean up expired persistent alerts
+        current_persistent = []
+        for alert in self.persistent_alerts:
+            if alert['expires_at'] > frame_num:
+                current_persistent.append(alert)
+        self.persistent_alerts = deque(current_persistent, maxlen=10)
         
         # Update recent alerts tracking
         self._update_alert_tracking(current_alerts)
@@ -172,7 +186,81 @@ class BehaviorAnalyzer:
                 'confidence': 0.6
             })
         
-        # 4. Stationary Too Long (Paradoxically suspicious in some contexts)
+        # 4. Talking Detection (based on rapid head position changes)
+        if len(behavior['attention_history']) >= self.attention_window:
+            attention_values = list(behavior['attention_history'])
+            # Look for rapid, small oscillations that might indicate talking
+            recent_changes = [abs(attention_values[i] - attention_values[i-1]) 
+                            for i in range(1, min(8, len(attention_values)))]
+            
+            if len(recent_changes) >= 5:
+                talking_pattern = np.std(recent_changes) > 0.05 and np.mean(recent_changes) > 0.02
+                if talking_pattern:
+                    alerts.append({
+                        'type': 'suspected_talking',
+                        'track_id': track_id,
+                        'severity': 2.5,
+                        'description': f'Person {track_id} shows talking-like head movements',
+                        'position': track['center'],
+                        'confidence': 0.7
+                    })
+        
+        # 5. Phone Usage Detection (hand-to-face gesture)
+        current_aspect_ratio = track['aspect_ratio']
+        if len(behavior['attention_history']) >= 3:
+            recent_ratios = list(behavior['attention_history'])[-3:]
+            # Detect sudden narrowing of bounding box (phone to ear)
+            if all(r < 0.6 for r in recent_ratios) and current_aspect_ratio < 0.5:
+                alerts.append({
+                    'type': 'phone_usage',
+                    'track_id': track_id,
+                    'severity': 3.0,
+                    'description': f'Person {track_id} possible phone usage detected',
+                    'position': track['center'],
+                    'confidence': 0.8
+                })
+        
+        # 6. Paper Sharing Movement (reaching toward others)
+        if len(behavior['movement_history']) >= 5:
+            recent_movements = list(behavior['movement_history'])[-5:]
+            # Detect pattern of movement then return (paper sharing)
+            if max(recent_movements) > 25 and recent_movements[-1] < 8:
+                alerts.append({
+                    'type': 'paper_sharing',
+                    'track_id': track_id,
+                    'severity': 2.8,
+                    'description': f'Person {track_id} suspicious reaching movement',
+                    'position': track['center'],
+                    'confidence': 0.6
+                })
+        
+        # 7. Extended Looking Around (exam anxiety or cheating)
+        if len(track['position_history']) >= 10:
+            positions = np.array(list(track['position_history'])[-10:])
+            position_spread = np.std(positions, axis=0).mean()
+            
+            if position_spread > 15:  # High variability in head position
+                alerts.append({
+                    'type': 'excessive_looking_around',
+                    'track_id': track_id,
+                    'severity': 2.0,
+                    'description': f'Person {track_id} looking around extensively',
+                    'position': track['center'],
+                    'confidence': 0.5
+                })
+        
+        # 8. Cheating Gestures (specific movement patterns)
+        if track['suspicious_movement_count'] > 3:
+            alerts.append({
+                'type': 'cheating_gestures',
+                'track_id': track_id,
+                'severity': 2.7,
+                'description': f'Person {track_id} repeated suspicious gestures',
+                'position': track['center'],
+                'confidence': 0.7
+            })
+        
+        # 9. Stationary Too Long (Paradoxically suspicious in some contexts)
         if track['stationary_frames'] > 300:  # 10 seconds at 30fps
             alerts.append({
                 'type': 'too_stationary',
@@ -227,14 +315,26 @@ class BehaviorAnalyzer:
                     movements.append(recent_movement)
             
             if len(movements) >= 2:
-                movement_sync = np.corrcoef(movements[:2])[0, 1] if len(movements) == 2 else 0
+                try:
+                    # Ensure we have valid arrays for correlation
+                    movements_array = np.array(movements[:2])
+                    if len(movements_array) == 2 and np.var(movements_array) > 0:
+                        correlation_matrix = np.corrcoef(movements_array)
+                        if correlation_matrix.shape == (2, 2):
+                            movement_sync = correlation_matrix[0, 1]
+                        else:
+                            movement_sync = 0
+                    else:
+                        movement_sync = 0
+                except:
+                    movement_sync = 0
                 
                 # High correlation in movement might indicate coordination
-                if movement_sync > 0.8 and np.mean(movements) > 5:
+                if not np.isnan(movement_sync) and movement_sync > 0.8 and np.mean(movements) > 5:
                     alerts.append({
                         'type': 'synchronized_movement',
                         'track_id': [track['track_id'] for track in track_list[:2]],
-                        'severity': movement_sync * 2,
+                        'severity': min(movement_sync * 2, 3.0),
                         'description': f'Synchronized suspicious movement detected',
                         'position': [0, 0],  # Will be updated in drawing
                         'confidence': 0.6
@@ -286,14 +386,14 @@ class BehaviorAnalyzer:
         
         return risk_score
     
-    def draw_alerts(self, frame: np.ndarray, alerts: List[Dict], 
+    def draw_alerts(self, frame: np.ndarray, current_alerts: List[Dict], 
                    show_risk_scores: bool = True) -> np.ndarray:
         """
-        Draw alert visualizations on frame.
+        Draw alert visualizations on frame including persistent alerts.
         
         Args:
             frame: Input frame
-            alerts: Current frame alerts
+            current_alerts: Current frame alerts (for immediate feedback)
             show_risk_scores: Whether to show individual risk scores
             
         Returns:
@@ -301,19 +401,27 @@ class BehaviorAnalyzer:
         """
         annotated_frame = frame.copy()
         
-        # Define alert colors
+        # Use persistent alerts for display (includes recent alerts)
+        display_alerts = list(self.persistent_alerts)
+        
+        # Define alert colors with more exam-specific types
         alert_colors = {
-            'excessive_movement': (0, 0, 255),      # Red
-            'attention_deviation': (0, 165, 255),   # Orange
-            'clustering': (255, 0, 255),            # Magenta
-            'unusual_posture': (0, 255, 255),       # Yellow
-            'synchronized_movement': (128, 0, 128), # Purple
-            'too_stationary': (128, 128, 128)       # Gray
+            'excessive_movement': (0, 0, 255),        # Red
+            'attention_deviation': (0, 165, 255),     # Orange  
+            'clustering': (255, 0, 255),              # Magenta
+            'unusual_posture': (0, 255, 255),         # Yellow
+            'synchronized_movement': (128, 0, 128),   # Purple
+            'suspected_talking': (0, 100, 255),       # Dark Orange
+            'phone_usage': (0, 0, 200),               # Dark Red
+            'paper_sharing': (255, 100, 100),         # Light Red
+            'excessive_looking_around': (100, 255, 100), # Light Green
+            'cheating_gestures': (200, 0, 200),       # Dark Magenta
+            'too_stationary': (128, 128, 128)         # Gray
         }
         
         # Draw individual alerts
         alert_y_offset = 150
-        for alert in alerts:
+        for alert in display_alerts:
             color = alert_colors.get(alert['type'], (255, 255, 255))
             position = alert['position']
             
@@ -324,19 +432,25 @@ class BehaviorAnalyzer:
                 # Draw severity indicator
                 severity_radius = int(alert['severity'] * 10)
                 cv2.circle(annotated_frame, tuple(position), severity_radius, color, 1)
+                
+                # Add alert type text near the marker
+                alert_text = alert['type'].replace('_', ' ').upper()
+                cv2.putText(annotated_frame, alert_text, 
+                           (position[0] + 20, position[1]), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         
         # Draw alert summary panel
-        panel_height = 120
+        panel_height = 140
         cv2.rectangle(annotated_frame, (10, alert_y_offset), 
-                     (400, alert_y_offset + panel_height), (0, 0, 0), -1)
+                     (450, alert_y_offset + panel_height), (0, 0, 0), -1)
         cv2.rectangle(annotated_frame, (10, alert_y_offset), 
-                     (400, alert_y_offset + panel_height), (255, 255, 255), 2)
+                     (450, alert_y_offset + panel_height), (255, 255, 255), 2)
         
         # Alert summary text
         summary = self.get_alert_summary()
         text_color = (255, 255, 255)
         
-        cv2.putText(annotated_frame, "BEHAVIOR ANALYSIS", (15, alert_y_offset + 20),
+        cv2.putText(annotated_frame, "EXAM MONITORING ALERTS", (15, alert_y_offset + 20),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
         
         cv2.putText(annotated_frame, f"Total Alerts: {summary['total_alerts']}", 
@@ -345,27 +459,48 @@ class BehaviorAnalyzer:
         cv2.putText(annotated_frame, f"Recent (1min): {summary.get('recent_alerts', 0)}", 
                    (15, alert_y_offset + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
         
-        cv2.putText(annotated_frame, f"Avg Severity: {summary.get('avg_severity', 0):.2f}", 
+        cv2.putText(annotated_frame, f"Persistent Alerts: {len(display_alerts)}", 
                    (15, alert_y_offset + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
         
-        # Current frame alerts
-        if alerts:
-            cv2.putText(annotated_frame, f"ACTIVE ALERTS: {len(alerts)}", 
-                       (15, alert_y_offset + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        cv2.putText(annotated_frame, f"Avg Severity: {summary.get('avg_severity', 0):.2f}", 
+                   (15, alert_y_offset + 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
         
-        # Draw legend
-        legend_x = frame.shape[1] - 200
+        # Current frame alerts (immediate feedback)
+        if current_alerts:
+            cv2.putText(annotated_frame, f"NEW ALERTS: {len(current_alerts)}", 
+                       (15, alert_y_offset + 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Show most recent alert description
+            latest_alert = current_alerts[-1]
+            alert_desc = latest_alert['type'].replace('_', ' ').title()
+            cv2.putText(annotated_frame, f"Latest: {alert_desc}", 
+                       (15, alert_y_offset + 125), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        
+        # Draw enhanced legend
+        legend_x = frame.shape[1] - 280
         legend_y = 30
-        cv2.putText(annotated_frame, "ALERT TYPES:", (legend_x, legend_y),
+        cv2.putText(annotated_frame, "EXAM ALERT TYPES:", (legend_x, legend_y),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
+        # Show top 6 most relevant alert types for exams
+        priority_alerts = [
+            ('excessive_movement', 'Excessive Movement'),
+            ('suspected_talking', 'Suspected Talking'),
+            ('attention_deviation', 'Looking Around'),
+            ('phone_usage', 'Phone Usage'),
+            ('paper_sharing', 'Paper Sharing'),
+            ('clustering', 'Student Clustering')
+        ]
+        
         y_offset = 50
-        for alert_type, color in list(alert_colors.items())[:4]:  # Show first 4
-            cv2.circle(annotated_frame, (legend_x + 10, legend_y + y_offset), 5, color, -1)
-            cv2.putText(annotated_frame, alert_type.replace('_', ' ').title(), 
-                       (legend_x + 25, legend_y + y_offset + 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            y_offset += 20
+        for alert_type, display_name in priority_alerts:
+            if alert_type in alert_colors:
+                color = alert_colors[alert_type]
+                cv2.circle(annotated_frame, (legend_x + 10, legend_y + y_offset), 5, color, -1)
+                cv2.putText(annotated_frame, display_name, 
+                           (legend_x + 25, legend_y + y_offset + 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+                y_offset += 18
         
         return annotated_frame
     

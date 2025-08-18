@@ -152,6 +152,7 @@ class PersonTracker:
                                  (track_center[1] - detection_center[1])**2)
                 
                 # Calculate area similarity (helps with webcam inconsistencies)
+                track = self.tracks[track_id]
                 area_similarity = 1.0 - abs(track['area'] - detection['area']) / max(track['area'], detection['area'])
                 
                 # Calculate confidence similarity
